@@ -29,7 +29,16 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    # 期望 weights 形状为 (d_out, d_in)，输入最后一维为 d_in
+    assert weights.shape == (d_out, d_in), (
+        f"weights.shape {tuple(weights.shape)} != ({d_out}, {d_in})"
+    )
+    assert in_features.shape[-1] == d_in, (
+        f"in_features last dim {in_features.shape[-1]} != d_in {d_in}"
+    )
+
+    # 无 bias 的线性层：Y = X @ W^T
+    return in_features @ weights.transpose(-1, -2)
 
 
 def run_embedding(
@@ -50,8 +59,28 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
-
-    raise NotImplementedError
+    # 检查 weights 形状
+    assert weights.shape == (vocab_size, d_model), (
+        f"weights.shape {tuple(weights.shape)} != ({vocab_size}, {d_model})"
+    )
+    
+    # 检查 token_ids 中的值是否在有效范围内
+    assert token_ids.min() >= 0 and token_ids.max() < vocab_size, (
+        f"token_ids values must be in range [0, {vocab_size}), "
+        f"got min={token_ids.min()}, max={token_ids.max()}"
+    )
+    
+    # 手动实现 embedding lookup
+    # 将 token_ids 展平，然后从 weights 中索引，最后恢复原始形状
+    original_shape = token_ids.shape
+    flat_token_ids = token_ids.flatten()  # 展平为 1D
+    
+    # 从 weights 中获取对应的嵌入向量
+    # weights[flat_token_ids] 形状为 (num_tokens, d_model)
+    flat_embeddings = weights[flat_token_ids]
+    
+    # 恢复原始形状，在最后添加 d_model 维度
+    return flat_embeddings.reshape(*original_shape, d_model)
 
 
 def run_swiglu(
@@ -76,14 +105,33 @@ def run_swiglu(
     Returns:
         Float[Tensor, "... d_model"]: Output embeddings of the same shape as the input embeddings.
     """
-    # Example:
-    # If your state dict keys match, you can use `load_state_dict()`
-    # swiglu.load_state_dict(weights)
-    # You can also manually assign the weights
-    # swiglu.w1.weight.data = w1_weight
-    # swiglu.w2.weight.data = w2_weight
-    # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    # 检查权重形状
+    assert w1_weight.shape == (d_ff, d_model), f"w1_weight.shape {w1_weight.shape} != ({d_ff}, {d_model})"
+    assert w2_weight.shape == (d_model, d_ff), f"w2_weight.shape {w2_weight.shape} != ({d_model}, {d_ff})"
+    assert w3_weight.shape == (d_ff, d_model), f"w3_weight.shape {w3_weight.shape} != ({d_ff}, {d_model})"
+    assert in_features.shape[-1] == d_model, f"in_features last dim {in_features.shape[-1]} != {d_model}"
+    
+    # SwiGLU 公式: SwiGLU(x) = W2 @ (SiLU(W1 @ x) ⊙ (W3 @ x))
+    # 其中 SiLU(x) = x * sigmoid(x)
+    
+    # 步骤1: 计算 W1 @ x 和 W3 @ x
+    # 使用矩阵乘法，处理任意前导维度
+    w1_out = in_features @ w1_weight.transpose(-1, -2)  # (..., d_ff)
+    w3_out = in_features @ w3_weight.transpose(-1, -2)  # (..., d_ff)
+    
+    # 步骤2: 实现 SiLU 激活函数
+    # SiLU(x) = x * sigmoid(x)
+    def silu(x):
+        return x * torch.sigmoid(x)
+    
+    # 步骤3: 计算 SiLU(W1 @ x) ⊙ (W3 @ x)
+    # 逐元素相乘
+    gated = silu(w1_out) * w3_out  # (..., d_ff)
+    
+    # 步骤4: 计算 W2 @ (gated result)
+    output = gated @ w2_weight.transpose(-1, -2)  # (..., d_model)
+    
+    return output
 
 
 def run_scaled_dot_product_attention(
