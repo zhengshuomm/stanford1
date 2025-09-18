@@ -152,7 +152,34 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
+    # 获取 d_k 维度
+    d_k = Q.shape[-1]
+    
+    # 步骤1: 计算 Q @ K^T，得到注意力分数
+    # Q: (..., queries, d_k), K: (..., keys, d_k)
+    # 结果: (..., queries, keys)
+    scores = Q @ K.transpose(-2, -1)
+    
+    # 步骤2: 缩放注意力分数
+    # 除以 √d_k 来防止梯度消失
+    scaled_scores = scores / (d_k ** 0.5)
+    
+    # 步骤3: 应用 mask（如果提供）
+    if mask is not None:
+        # 将 mask 为 False 的位置设置为 -inf，这样 softmax 后为 0
+        scaled_scores = torch.where(mask, scaled_scores, float('-inf'))
+    
+    # 步骤4: 手动实现 softmax
+    # 为了数值稳定性，减去最大值
+    attention_weights = torch.softmax(scaled_scores, dim=-1)
+    
+    # 步骤5: 计算加权和
+    # attention_weights: (..., queries, keys)
+    # V: (..., keys, d_v)
+    # 结果: (..., queries, d_v)
+    output = attention_weights @ V
+    
+    return output
 
 
 def run_multihead_self_attention(
@@ -164,29 +191,55 @@ def run_multihead_self_attention(
     o_proj_weight: Float[Tensor, " d_model d_v"],
     in_features: Float[Tensor, " ... sequence_length d_in"],
 ) -> Float[Tensor, " ... sequence_length d_out"]:
-    """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This function should not use RoPE.
-    See section 3.2.2 of Vaswani et al., 2017.
-
-    Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
-
-    Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
-    """
-    raise NotImplementedError
+    # 每头维度（要求 d_model 可被 num_heads 整除）
+    # d_model: 模型维度
+    # num_heads: 注意力头数
+    # head_dim = d_model // num_heads
+    head_dim = d_model // num_heads
+    # 形状与权重基本校验
+    # in_features: (..., seq_len, d_model)
+    # q_proj_weight: (d_model, d_model) 或 (head_dim, d_model)
+    # k_proj_weight: (d_model, d_model) 或 (head_dim, d_model)
+    # v_proj_weight: (d_model, d_model) 或 (head_dim, d_model)
+    # o_proj_weight: (d_model, d_model)
+    assert in_features.shape[-1] == d_model
+    assert o_proj_weight.shape == (d_model, d_model)
+    # Q/K/V 线性投影（无 bias）：y = x @ W^T
+    # q_proj_weight, k_proj_weight, v_proj_weight: (d_model, d_model) 或 (head_dim, d_model)
+    # Q, K, V: (..., seq_len, d_model)
+    Q = in_features @ q_proj_weight.transpose(-1, -2)
+    K = in_features @ k_proj_weight.transpose(-1, -2)
+    V = in_features @ v_proj_weight.transpose(-1, -2)
+    # 拆分为多头并把 head 维提前，便于并行注意力
+    # 先重塑为: (..., seq_len, num_heads, head_dim)
+    # 再转置为:  (..., num_heads, seq_len, head_dim)
+    # batch_dims: 输入中除去最后两维的所有前导维（可能为空元组）
+    # seq_len: 输入序列长度
+    *batch_dims, seq_len, _ = Q.shape
+    Q = Q.reshape(*batch_dims, seq_len, num_heads, head_dim).transpose(-3, -2)
+    K = K.reshape(*batch_dims, seq_len, num_heads, head_dim).transpose(-3, -2)
+    V = V.reshape(*batch_dims, seq_len, num_heads, head_dim).transpose(-3, -2)
+    # 因果掩码（不看未来位置），广播到 (..., num_heads, L, L)
+    # 其中 L = seq_len
+    L = Q.shape[-2]
+    # causal: (L, L)，下三角 True，表示允许注意
+    causal = torch.ones(L, L, dtype=torch.bool, device=Q.device).tril()
+    # mask: (..., num_heads, L, L)
+    mask = causal
+    for _ in range(len(batch_dims)):
+        mask = mask.unsqueeze(0)
+    mask = mask.unsqueeze(1).expand(*batch_dims, num_heads, L, L)
+    # 缩放点积注意力（数值稳定 softmax 内部已处理）
+    # 输入: Q/K/V: (..., num_heads, L, head_dim)
+    # 输出: Ah:   (..., num_heads, L, head_dim)
+    Ah = run_scaled_dot_product_attention(Q, K, V, mask=mask)
+    # 合并多头并做输出投影
+    # 先转回: (..., L, num_heads, head_dim)
+    # 再重塑: (..., L, d_model)
+    # 最后输出投影: y = x @ W^T，得到 (..., L, d_model)
+    # out: (..., L, d_model)
+    out = Ah.transpose(-3, -2).reshape(*batch_dims, seq_len, d_model)
+    return out @ o_proj_weight.transpose(-1, -2)
 
 
 def run_multihead_self_attention_with_rope(
@@ -201,32 +254,124 @@ def run_multihead_self_attention_with_rope(
     in_features: Float[Tensor, " ... sequence_length d_in"],
     token_positions: Int[Tensor, " ... sequence_length"] | None = None,
 ) -> Float[Tensor, " ... sequence_length d_out"]:
-    """
-    Given the key, query, and value projection weights of a naive unbatched
-    implementation of multi-head attention, return the output of an optimized batched
-    implementation. This implementation should handle the key, query, and value projections
-    for all heads in a single matrix multiply.
-    This version of MHA should include RoPE.
-    In this case, the RoPE embedding dimension must be the head embedding dimension (d_model // num_heads).
-    See section 3.2.2 of Vaswani et al., 2017.
+    # 每头维度
+    # head_dim = d_model // num_heads
+    head_dim = d_model // num_heads
+    # 基本校验
+    # in_features: (..., seq_len, d_model)
+    # q_proj_weight/k_proj_weight/v_proj_weight: (d_model, d_model) 或 (head_dim, d_model)
+    # o_proj_weight: (d_model, d_model)
+    assert in_features.shape[-1] == d_model
+    assert o_proj_weight.shape == (d_model, d_model)
+    # Q/K/V 投影：y = x @ W^T
+    # Q, K, V: (..., seq_len, d_model)
+    Q = in_features @ q_proj_weight.transpose(-1, -2)
+    K = in_features @ k_proj_weight.transpose(-1, -2)
+    V = in_features @ v_proj_weight.transpose(-1, -2)
+    # 拆头（head 放在最后，便于 RoPE 逐对旋转）
+    # 形状: (..., seq_len, num_heads, head_dim)
+    # batch_dims: 前导批维
+    # seq_len: 序列长度
+    *batch_dims, seq_len, _ = Q.shape
+    Q = Q.reshape(*batch_dims, seq_len, num_heads, head_dim)
+    K = K.reshape(*batch_dims, seq_len, num_heads, head_dim)
+    V = V.reshape(*batch_dims, seq_len, num_heads, head_dim)
+    # 位置索引（若未提供则用绝对位置 0..L-1），广播到 batch 维
+    # pos: (..., seq_len)
+    if token_positions is None:
+        pos = torch.arange(seq_len, device=in_features.device)
+        for _ in range(len(batch_dims)):
+            pos = pos.unsqueeze(0)
+    else:
+        pos = token_positions
+    # 对 Q/K 应用 RoPE（按偶奇维成对旋转）
+    # 输入: (..., seq_len, num_heads, head_dim)
+    # 输出: 同形状（位置编码已注入）
+    # 变量含义：
+    # - theta: RoPE 频率基数（通常 10000.0）
+    # - head_dim: 单头维度（必须为偶数，偶奇成对旋转）
+    Q = apply_rope(Q, pos, theta, head_dim)
+    K = apply_rope(K, pos, theta, head_dim)
+    # 调整为并行注意力布局
+    # 转置为: (..., num_heads, seq_len, head_dim)
+    Q = Q.transpose(-3, -2)
+    K = K.transpose(-3, -2)
+    V = V.transpose(-3, -2)
+    # 因果掩码并执行 SDPA
+    # mask: (..., num_heads, L, L)
+    L = Q.shape[-2]
+    # causal: (L, L) 下三角 True
+    causal = torch.ones(L, L, dtype=torch.bool, device=Q.device).tril()
+    mask = causal
+    for _ in range(len(batch_dims)):
+        mask = mask.unsqueeze(0)
+    mask = mask.unsqueeze(1).expand(*batch_dims, num_heads, L, L)
+    Ah = run_scaled_dot_product_attention(Q, K, V, mask=mask)
+    # 合并多头与输出投影
+    # 输出: (..., L, d_model) -> 经输出投影 -> (..., L, d_model)
+    out = Ah.transpose(-3, -2).reshape(*batch_dims, seq_len, d_model)
+    return out @ o_proj_weight.transpose(-1, -2)
 
+
+def apply_rope(x: Float[Tensor, "... seq_len num_heads head_dim"], 
+               positions: Int[Tensor, "... seq_len"], 
+               theta: float, 
+               head_dim: int) -> Float[Tensor, "... seq_len num_heads head_dim"]:
+    """
+    应用 RoPE (Rotary Position Embedding) 到输入张量。
+    
     Args:
-        d_model (int): Dimensionality of the feedforward input and output.
-        num_heads (int): Number of heads to use in multi-headed attention.
-        max_seq_len (int): Maximum sequence length to pre-cache if your implementation does that.
-        theta (float): RoPE parameter.
-        q_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the Q projection
-        k_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the K projection
-        v_proj_weight (Float[Tensor, "d_k d_in"]): Weights for the V projection
-        o_proj_weight (Float[Tensor, "d_model d_v"]): Weights for the output projection
-        in_features (Float[Tensor, "... sequence_length d_in"]): Tensor to run your implementation on.
-        token_positions (Int[Tensor, " ... sequence_length"] | None): Optional tensor with the positions of the tokens
-
+        x: 输入张量，形状为 (..., seq_len, num_heads, head_dim)
+            - 末维 head_dim 必须为偶数（偶/奇成对）
+        positions: 位置张量，形状为 (..., seq_len)
+            - 与 x 的前导批维一致
+        theta: RoPE 参数（频率基数，如 10000.0）
+        head_dim: 每个头的维度（偶数）
+    
     Returns:
-        Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
-        implementation with the given QKV projection weights and input features.
+        应用 RoPE 后的张量，形状同 x
     """
-    raise NotImplementedError
+    # 确保 head_dim 是偶数（RoPE 需要成对的维度）
+    assert head_dim % 2 == 0, f"head_dim {head_dim} must be even for RoPE"
+    
+    # 获取位置张量的形状，用于广播
+    pos_shape = positions.shape  # (..., seq_len)
+    # 在最后添加 num_heads 和 head_dim 维度用于广播
+    positions = positions.unsqueeze(-1).unsqueeze(-1)  # (..., seq_len, 1, 1)
+    
+    # 生成频率
+    # 对于每个维度对 (i, i+1)，频率为 theta^(-2i/head_dim)
+    # freqs: (head_dim/2,)
+    freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=x.device, dtype=torch.float32) / head_dim))
+    
+    # 计算角度: positions * freqs
+    # angles: (..., seq_len, 1, head_dim/2)
+    angles = positions.float() * freqs  # (..., seq_len, 1, head_dim//2)
+    
+    # 计算 cos 和 sin
+    # cos_vals/sin_vals: (..., seq_len, 1, head_dim/2)
+    cos_vals = torch.cos(angles)  # (..., seq_len, 1, head_dim//2)
+    sin_vals = torch.sin(angles)  # (..., seq_len, 1, head_dim//2)
+    
+    # 将 x 分割为成对的维度
+    # x_even/x_odd: (..., seq_len, num_heads, head_dim/2)
+    x_even = x[..., ::2]  # 偶数索引
+    x_odd = x[..., 1::2]  # 奇数索引
+    
+    # 应用旋转
+    # 对于每对 (x_even[i], x_odd[i])，旋转为:
+    # (x_even[i] * cos - x_odd[i] * sin, x_even[i] * sin + x_odd[i] * cos)
+    # rotated_even/rotated_odd: (..., seq_len, num_heads, head_dim/2)
+    rotated_even = x_even * cos_vals - x_odd * sin_vals
+    rotated_odd = x_even * sin_vals + x_odd * cos_vals
+    
+    # 重新组合旋转后的张量
+    # result: (..., seq_len, num_heads, head_dim)
+    result = torch.zeros_like(x)
+    result[..., ::2] = rotated_even
+    result[..., 1::2] = rotated_odd
+    
+    return result
 
 
 def run_rope(
@@ -248,7 +393,41 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    # 维度说明：
+    # in_query_or_key: (..., seq_len, d_k)
+    # token_positions: (..., seq_len)
+    # 输出形状同输入：(..., seq_len, d_k)
+    # d_k 必须为偶数（偶/奇索引成对旋转）
+    assert d_k % 2 == 0, f"d_k {d_k} must be even for RoPE"
+
+    # 广播 positions 至与输入批维一致
+    # positions: (..., seq_len, 1)
+    positions = token_positions.unsqueeze(-1)
+
+    # 频率向量 freqs: (d_k/2,)
+    freqs = 1.0 / (theta ** (torch.arange(0, d_k, 2, device=in_query_or_key.device, dtype=torch.float32) / d_k))
+
+    # angles: (..., seq_len, d_k/2)
+    angles = positions.float() * freqs
+
+    # cos/sin: (..., seq_len, d_k/2)
+    cos_vals = torch.cos(angles)
+    sin_vals = torch.sin(angles)
+
+    # 拆分偶/奇分量：(..., seq_len, d_k/2)
+    x_even = in_query_or_key[..., ::2]
+    x_odd = in_query_or_key[..., 1::2]
+
+    # 旋转：
+    # [x_even', x_odd'] = [x_even * cos - x_odd * sin, x_even * sin + x_odd * cos]
+    rotated_even = x_even * cos_vals - x_odd * sin_vals
+    rotated_odd = x_even * sin_vals + x_odd * cos_vals
+
+    # 合并回原维度：(..., seq_len, d_k)
+    out = torch.zeros_like(in_query_or_key)
+    out[..., ::2] = rotated_even
+    out[..., 1::2] = rotated_odd
+    return out
 
 
 def run_transformer_block(
